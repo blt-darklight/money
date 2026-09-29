@@ -1,0 +1,14 @@
+# 项目级主题：强制浅色 + 养基宝风格蓝色主色调
+# （start.bat 以项目目录为工作目录运行，此文件才会生效；勿删）
+[theme]
+base = "light"
+primaryColor = "#2E7CF6"
+backgroundColor = "#F5F8FE"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#1F2937"
+
+[client]
+toolbarMode = "minimal"
+
+[browser]
+gatherUsageStats = false
