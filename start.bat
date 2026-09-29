@@ -17,6 +17,9 @@ if not exist "%PY%" (
 )
 
 echo Starting Daily PnL Tracker...
+rem Patch the Streamlit frontend for old mobile browsers. Idempotent:
+rem re-runs automatically after a Streamlit reinstall or upgrade.
+"%PY%" "%~dp0patch_streamlit.py"
 echo   Browser : http://localhost:8501
 echo   Phone   : http://YOUR-PC-IP:8501   (run "ipconfig" on this PC to find the IP)
 echo Close this window to stop the app.

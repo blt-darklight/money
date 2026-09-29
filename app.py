@@ -105,65 +105,146 @@ def load_bg_css(path: str, mtime: float) -> str | None:
       background-size: cover !important;
       background-position: center !important;
       background-attachment: fixed !important;  /* 固定跟随屏幕，不随内容滚动 */
-      color: #1F2937 !important;  /* 正文统一深灰，杜绝白底白字 */
     }}
     [data-testid="stHeader"] {{ background: transparent; }}
-    footer, #MainMenu {{ visibility: hidden; }}
-    /* 居中窄栏（仿养基宝）：纯色浅灰蓝底 + 钝化圆角 */
-    .block-container {{
-      max-width: 920px !important;
-      margin: 0 auto !important;
-      padding: 1.4rem 2.2rem 4rem !important;
-      background: #EDF2F9;
-      border-radius: 22px;
-      box-shadow: 0 4px 22px rgba(30, 94, 219, 0.09);
-    }}
-    /* 白色圆角卡片（四角钝化） */
-    [data-testid="stVerticalBlockBorderWrapper"] {{
-      background: #FFFFFF;
-      border: 1px solid rgba(46, 124, 246, 0.10) !important;
-      border-radius: 18px !important;
-      box-shadow: 0 2px 12px rgba(30, 94, 219, 0.06);
-      padding: 18px 22px !important;
-    }}
-    h1, h2, h3, [data-testid="stMetricLabel"], [data-testid="stMetricValue"] {{
-      color: #1F2937;
-    }}
-    /* ---- 盈亏日历卡片网格 ---- */
-    .pcal-row {{ display: grid; gap: 7px; margin-bottom: 7px; }}
-    .pcal-cols-5 {{ grid-template-columns: repeat(5, 1fr); }}
-    .pcal-cols-4 {{ grid-template-columns: repeat(4, 1fr); }}
-    .pcal-cols-3 {{ grid-template-columns: repeat(3, 1fr); }}
-    .pcal-hd {{ text-align: center; color: #9CA3AF; font-size: 13px; padding: 2px 0; }}
-    .pcal-cell {{
-      border-radius: 13px; text-align: center; padding: 7px 2px 9px;
-      min-height: 54px; background: #FFFFFF; border: 1px solid #EEF2F7;
-    }}
-    .pcal-cell .d {{ font-size: 12px; color: #9CA3AF; line-height: 1.3; }}
-    .pcal-cell .v {{ font-size: 15px; font-weight: 600; margin-top: 1px; color: #6B7280; }}
-    .pcal-cell .big {{ font-size: 18px; }}
-    .pcal-pos {{ background: {POS_BG}; border-color: {POS_BG}; }}
-    .pcal-pos .v {{ color: {RED}; }}
-    .pcal-neg {{ background: {NEG_BG}; border-color: {NEG_BG}; }}
-    .pcal-neg .v {{ color: {GREEN}; }}
-    .pcal-today-pos {{ background: {RED}; border-color: {RED}; }}
-    .pcal-today-pos .d, .pcal-today-pos .v {{ color: #FFFFFF; }}
-    .pcal-today-neg {{ background: {GREEN}; border-color: {GREEN}; }}
-    .pcal-today-neg .d, .pcal-today-neg .v {{ color: #FFFFFF; }}
-    .pcal-today-flat {{ background: {BLUE}; border-color: {BLUE}; }}
-    .pcal-today-flat .d, .pcal-today-flat .v {{ color: #FFFFFF; }}
-    .pcal-mute {{ background: #F8FAFC; }}
-    .pcal-mute .d, .pcal-mute .v {{ color: #CBD5E1; }}
-    /* 底部累计行 */
-    .pcal-foot {{
-      display: flex; justify-content: space-between; padding: 6px 4px 0;
-      font-size: 14px; color: #4B5563; flex-wrap: wrap; gap: 6px;
-    }}
     </style>
     """
 
 
-def inject_background() -> None:
+# 全局浅色样式：无论有没有背景图都注入（v3.8.6 手机端适配）。
+# color-scheme: only light —— 声明本页只有浅色版，禁止手机浏览器
+# 「强制深色/夜间模式」做算法性暗化（电脑正常、手机上白底黑字被反成
+# 黑底白字，就是浏览器层强制深色干的，与 Streamlit 主题配置无关）。
+GLOBAL_CSS = f"""
+<style>
+:root, html {{ color-scheme: only light; }}
+html, body {{ background: #F5F8FE !important; }}
+.stApp {{ color: #1F2937 !important; }}  /* 正文统一深灰，杜绝白底白字 */
+footer, #MainMenu {{ visibility: hidden; }}
+/* 居中窄栏（仿养基宝）：纯色浅灰蓝底 + 钝化圆角 */
+.block-container {{
+  max-width: 920px !important;
+  margin: 0 auto !important;
+  padding: 1.4rem 2.2rem 4rem !important;
+  background: #EDF2F9;
+  border-radius: 22px;
+  box-shadow: 0 4px 22px rgba(30, 94, 219, 0.09);
+}}
+/* 白色圆角卡片（四角钝化） */
+[data-testid="stVerticalBlockBorderWrapper"] {{
+  background: #FFFFFF;
+  border: 1px solid rgba(46, 124, 246, 0.10) !important;
+  border-radius: 18px !important;
+  box-shadow: 0 2px 12px rgba(30, 94, 219, 0.06);
+  padding: 18px 22px !important;
+}}
+h1, h2, h3, [data-testid="stMetricLabel"], [data-testid="stMetricValue"] {{
+  color: #1F2937;
+}}
+/* ---- 盈亏日历卡片网格 ---- */
+.pcal-row {{ display: grid; gap: 7px; margin-bottom: 7px; }}
+.pcal-cols-5 {{ grid-template-columns: repeat(5, 1fr); }}
+.pcal-cols-4 {{ grid-template-columns: repeat(4, 1fr); }}
+.pcal-cols-3 {{ grid-template-columns: repeat(3, 1fr); }}
+.pcal-hd {{ text-align: center; color: #9CA3AF; font-size: 13px; padding: 2px 0; }}
+.pcal-cell {{
+  border-radius: 13px; text-align: center; padding: 7px 2px 9px;
+  min-height: 54px; background: #FFFFFF; border: 1px solid #EEF2F7;
+}}
+.pcal-cell .d {{ font-size: 12px; color: #9CA3AF; line-height: 1.3; }}
+.pcal-cell .v {{ font-size: 15px; font-weight: 600; margin-top: 1px; color: #6B7280; }}
+.pcal-cell .big {{ font-size: 18px; }}
+.pcal-pos {{ background: {POS_BG}; border-color: {POS_BG}; }}
+.pcal-pos .v {{ color: {RED}; }}
+.pcal-neg {{ background: {NEG_BG}; border-color: {NEG_BG}; }}
+.pcal-neg .v {{ color: {GREEN}; }}
+.pcal-today-pos {{ background: {RED}; border-color: {RED}; }}
+.pcal-today-pos .d, .pcal-today-pos .v {{ color: #FFFFFF; }}
+.pcal-today-neg {{ background: {GREEN}; border-color: {GREEN}; }}
+.pcal-today-neg .d, .pcal-today-neg .v {{ color: #FFFFFF; }}
+.pcal-today-flat {{ background: {BLUE}; border-color: {BLUE}; }}
+.pcal-today-flat .d, .pcal-today-flat .v {{ color: #FFFFFF; }}
+.pcal-mute {{ background: #F8FAFC; }}
+.pcal-mute .d, .pcal-mute .v {{ color: #CBD5E1; }}
+/* 底部累计行 */
+.pcal-foot {{
+  display: flex; justify-content: space-between; padding: 6px 4px 0;
+  font-size: 14px; color: #4B5563; flex-wrap: wrap; gap: 6px;
+}}
+/* ---- 简易 HTML 表格（替代 st.dataframe，旧手机内核零 JS 依赖） ---- */
+.htable-wrap {{
+  max-height: 420px; overflow: auto;
+  border: 1px solid #E5EAF2; border-radius: 10px; background: #FFFFFF;
+}}
+.htable {{ width: 100%; border-collapse: collapse; font-size: 14px; color: #1F2937; }}
+.htable th {{
+  position: sticky; top: 0; background: #F1F5FB; color: #475569;
+  font-weight: 600; padding: 8px 12px; white-space: nowrap; text-align: left;
+}}
+.htable td {{ padding: 7px 12px; border-top: 1px solid #F1F5F9; white-space: nowrap; }}
+.htable tbody tr:nth-child(even) {{ background: #F8FAFC; }}
+/* ---- 盈亏总览卡（养基宝风格蓝色渐变，class 版便于手机端响应式） ---- */
+.hero-card {{
+  background: linear-gradient(135deg, #4E92F8 0%, {BLUE} 60%, #2563EB 100%);
+  border-radius: 20px; padding: 20px 26px; color: #FFFFFF;
+  box-shadow: 0 4px 16px rgba(37, 99, 235, 0.25);
+}}
+.hero-top {{
+  display: flex; justify-content: space-between; opacity: .85;
+  font-size: 13px; flex-wrap: wrap; gap: 2px 12px;
+}}
+.hero-main {{
+  display: flex; align-items: flex-end; gap: 40px;
+  margin-top: 10px; flex-wrap: wrap;
+}}
+.hero-label {{ font-size: 13px; opacity: .88; }}
+.hero-big {{ font-size: 40px; font-weight: 700; line-height: 1.15; }}
+.hero-sub {{ font-size: 14px; opacity: .92; }}
+.hero-sub .sep {{ opacity: .55; margin: 0 6px; }}
+.hero-right {{
+  margin-left: auto; display: flex; gap: 40px;
+  text-align: right; padding-bottom: 4px;
+}}
+.hero-val {{ font-size: 22px; font-weight: 600; }}
+/* ---- 手机端（≤640px）适配：窄屏下收留白、列纵排、日历格缩小 ---- */
+@media (max-width: 640px) {{
+  .block-container {{
+    max-width: 100% !important;
+    padding: 1rem 0.8rem 3rem !important;
+  }}
+  [data-testid="stVerticalBlockBorderWrapper"] {{
+    padding: 14px 13px !important;
+    border-radius: 14px !important;
+  }}
+  /* 走势/日历控制、按钮行、弹窗双平台输入：全部改为纵向堆叠，不再挤压 */
+  [data-testid="stColumn"] {{
+    flex: 1 1 100% !important;
+    width: 100% !important;
+    min-width: 100% !important;
+  }}
+  /* 总览卡：窄屏纵向堆叠，右侧指标改左对齐 */
+  .hero-card {{ padding: 16px 16px 18px; border-radius: 16px; }}
+  .hero-main {{ flex-direction: column; align-items: stretch; gap: 12px; }}
+  .hero-big {{ font-size: 34px; }}
+  .hero-right {{ margin-left: 0; text-align: left; gap: 28px; padding-bottom: 0; }}
+  .hero-val {{ font-size: 20px; }}
+  /* 日历卡片网格：格子与字号按窄屏收紧 */
+  .pcal-row {{ gap: 5px; margin-bottom: 5px; }}
+  .pcal-cell {{ min-height: 46px; padding: 5px 1px 7px; border-radius: 10px; }}
+  .pcal-cell .d {{ font-size: 11px; }}
+  .pcal-cell .v {{ font-size: 12px; }}
+  .pcal-cell .big {{ font-size: 14px; }}
+  .pcal-foot {{ font-size: 13px; }}
+  /* 明细/月度表格：字号收紧（仍可横向滑动） */
+  .htable {{ font-size: 13px; }}
+  .htable th, .htable td {{ padding: 6px 9px; }}
+}}
+</style>
+"""
+
+
+def inject_css() -> None:
+    st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
     path = find_bg()
     if path:
         css = load_bg_css(path, os.path.getmtime(path))
@@ -191,6 +272,29 @@ def _fmt_signed(v, kind: str) -> str:
     if v is None or pd.isna(v):
         return "—"
     return f"{v:+,.2f}{'%' if kind == '收益率' else ''}"
+
+
+def html_table(headers, rows, aligns=None) -> str:
+    """写死浅色的简易表格（替代 st.dataframe，旧手机内核零 JS 依赖）。
+
+    rows 每格为 (文本, 颜色或 None)；aligns 控制每列对齐，默认首列左、其余右。
+    """
+    if aligns is None:
+        aligns = ["left"] + ["right"] * (len(headers) - 1)
+    th = "".join(f'<th style="text-align:{a}">{h}</th>'
+                 for h, a in zip(headers, aligns))
+    trs = []
+    for row in rows:
+        tds = []
+        for (t, c), a in zip(row, aligns):
+            style = f"text-align:{a};"
+            if c:
+                style += f"color:{c};font-weight:600;"
+            tds.append(f'<td style="{style}">{t}</td>')
+        trs.append("<tr>" + "".join(tds) + "</tr>")
+    return ('<div class="htable-wrap"><table class="htable">'
+            f"<thead><tr>{th}</tr></thead><tbody>{''.join(trs)}</tbody>"
+            "</table></div>")
 
 
 # ---------------- 指数对比数据 ----------------
@@ -658,7 +762,7 @@ init_db()
 
 # ---------------- 页面 ----------------
 st.set_page_config(page_title="每日收益 · 跨平台汇总", layout="wide")
-inject_background()
+inject_css()
 
 
 # ---------------- 录入弹窗 ----------------
@@ -763,30 +867,28 @@ rate_txt = "—" if day_rate is None or pd.isna(day_rate) else f"{day_rate:+.2f}
 cum_rate_txt = "—" if cum_rate is None or pd.isna(cum_rate) else f"{cum_rate:+.2f}%"
 st.markdown(
     f"""
-    <div style="background:linear-gradient(135deg,#4E92F8 0%,{BLUE} 60%,#2563EB 100%);
-                border-radius:20px;padding:20px 26px;color:#FFFFFF;
-                box-shadow:0 4px 16px rgba(37,99,235,0.25);">
-      <div style="display:flex;justify-content:space-between;opacity:.85;font-size:13px">
+    <div class="hero-card">
+      <div class="hero-top">
         <span>每日收益 · 跨平台自动汇总</span>
         <span>截至 {last_date:%Y-%m-%d}</span>
       </div>
-      <div style="display:flex;align-items:flex-end;gap:40px;margin-top:10px;flex-wrap:wrap">
+      <div class="hero-main">
         <div>
-          <div style="font-size:13px;opacity:.88">当日总收益</div>
-          <div style="font-size:40px;font-weight:700;line-height:1.15">{_fmt(daily_sum)}</div>
-          <div style="font-size:14px;opacity:.92">当日收益率&nbsp;&nbsp;{rate_txt}
-            <span style="opacity:.55">&nbsp;｜&nbsp;</span>
+          <div class="hero-label">当日总收益</div>
+          <div class="hero-big">{_fmt(daily_sum)}</div>
+          <div class="hero-sub">当日收益率&nbsp;&nbsp;{rate_txt}
+            <span class="sep">&nbsp;｜&nbsp;</span>
             累计收益率&nbsp;&nbsp;{cum_rate_txt}
           </div>
         </div>
-        <div style="margin-left:auto;display:flex;gap:40px;text-align:right;padding-bottom:4px">
+        <div class="hero-right">
           <div>
-            <div style="font-size:13px;opacity:.88">总市值</div>
-            <div style="font-size:22px;font-weight:600">{_fmt(total_mv)}</div>
+            <div class="hero-label">总市值</div>
+            <div class="hero-val">{_fmt(total_mv)}</div>
           </div>
           <div>
-            <div style="font-size:13px;opacity:.88">总收益</div>
-            <div style="font-size:22px;font-weight:600">{_fmt(total_cum)}</div>
+            <div class="hero-label">总收益</div>
+            <div class="hero-val">{_fmt(total_cum)}</div>
           </div>
         </div>
       </div>
@@ -1006,6 +1108,9 @@ with st.container(border=True):
                         unsafe_allow_html=True)
 
 # ---------------- 明细 / 月度 ----------------
+# 注：明细与月度统计用自定义 HTML 表格（v3.8.6），不再用 st.dataframe——
+# 旧手机浏览器内核不支持其前端依赖的新 JS API（structuredClone/toSorted），
+# 展开时会报 ReferenceError；纯 HTML 表格任何浏览器都能渲染。
 section("数据")
 with st.expander("查看明细数据"):
     detail = d.drop(columns=["前期市值"])
@@ -1013,18 +1118,23 @@ with st.expander("查看明细数据"):
     detail = detail.sort_values(
         ["date", "_o"], ascending=[False, True], kind="stable"
     ).drop(columns="_o")
-    st.dataframe(
-        detail,
-        hide_index=True,
-        column_config={
-            "date": st.column_config.DateColumn("日期", format="YYYY-MM-DD"),
-            "platform": st.column_config.TextColumn("平台"),
-            "market_value": st.column_config.NumberColumn("当日市值", format="%.2f"),
-            "total_pnl": st.column_config.NumberColumn("总收益", format="%.2f"),
-            "当日收益": st.column_config.NumberColumn("当日收益(推算)", format="%.2f"),
-            "当日收益率": st.column_config.NumberColumn("当日收益率(%)", format="%.2f"),
-        },
-        **STRETCH,
+    rows = []
+    for _, r in detail.iterrows():
+        day, rate = r["当日收益"], r["当日收益率"]
+        rows.append([
+            (f"{r['date']:%Y-%m-%d}", None),
+            (r["platform"], None),
+            (_fmt(r["market_value"]), None),
+            (_fmt(r["total_pnl"]), _sign_color(r["total_pnl"])),
+            (_fmt(day), _sign_color(day)),
+            (_fmt(rate), _sign_color(rate)),
+        ])
+    st.markdown(
+        html_table(
+            ["日期", "平台", "当日市值", "总收益", "当日收益(推算)", "当日收益率(%)"],
+            rows,
+        ),
+        unsafe_allow_html=True,
     )
 
 with st.expander("月度统计"):
@@ -1035,8 +1145,15 @@ with st.expander("月度统计"):
         .sort_values("月份", ascending=False)
     )
     monthly.columns = ["月份", "当月总收益"]
-    monthly["当月总收益"] = monthly["当月总收益"].map("{:,.2f}".format)
-    st.dataframe(monthly, hide_index=True, **STRETCH)
+    rows = [
+        [(r["月份"], None),
+         (f"{r['当月总收益']:+,.2f}", _sign_color(r["当月总收益"]))]
+        for _, r in monthly.iterrows()
+    ]
+    st.markdown(
+        html_table(["月份", "当月总收益"], rows, aligns=["left", "right"]),
+        unsafe_allow_html=True,
+    )
 
 st.caption(
     "每日收益=总收益逐次差值；每平台首条记录把总收益整体计为首期盈亏（首日/首月/首年都体现） ｜ "
