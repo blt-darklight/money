@@ -28,6 +28,7 @@
 """
 import base64
 import io
+import json
 import os
 import sqlite3
 from datetime import date, timedelta
@@ -43,6 +44,12 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB = os.path.join(BASE_DIR, "portfolio.db")
 
 PLATFORMS = ["同花顺", "养基宝"]  # 新增平台只需在此列表加名字
+
+# 录入草稿（v3.9）：手机切后台会导致 Streamlit 重连重跑、录入弹窗被关、
+# 控件状态清空。填过的内容实时落袋（session_state + URL），
+# 回来时自动重开面板并回填，不用重新录入。
+DRAFT_SS = "_entry_draft"    # 草稿在 session_state 里的键
+DRAFT_QP = "draft"           # 草稿在 URL query param 里的键（抗页面重载）
 
 RED = "#E5484D"       # 盈利（国内习惯：红涨）
 GREEN = "#30A46C"     # 亏损（绿跌）
@@ -766,6 +773,87 @@ inject_css()
 
 
 # ---------------- 录入弹窗 ----------------
+# ---- 草稿保护（v3.9）：填过的内容不因切后台/重连/重载而丢 ----
+def _entry_has_content(e: dict) -> bool:
+    """这份平台填写是否算「有内容」（全默认则不算，避免无谓自动弹窗）。"""
+    return bool(e.get("daily") or e.get("mv") or e.get("tp")
+                or e.get("on") is False
+                or e.get("mode") not in (None, "当日收益"))
+
+
+def _draft_from_url() -> dict | None:
+    """从 URL 还原草稿（手机浏览器把页面回收/刷新后仍能恢复）。"""
+    raw = st.query_params.get(DRAFT_QP)
+    if not raw:
+        return None
+    try:
+        obj = json.loads(base64.urlsafe_b64decode(raw.encode()).decode())
+    except Exception:
+        return None
+    return obj if isinstance(obj, dict) and "entries" in obj else None
+
+
+def _draft_load() -> dict | None:
+    """当前草稿：session_state 优先，其次 URL（并回填 session_state）。"""
+    d = st.session_state.get(DRAFT_SS)
+    if not isinstance(d, dict):
+        d = _draft_from_url()
+        if d:
+            st.session_state[DRAFT_SS] = d
+    return d if isinstance(d, dict) else None
+
+
+def _draft_save(d_in: date, entries: dict) -> None:
+    """把正在填的内容存为草稿：session_state + URL，切后台/重载都能回来。"""
+    data = {"date": d_in.isoformat(), "entries": entries}
+    st.session_state[DRAFT_SS] = data
+    try:
+        st.query_params[DRAFT_QP] = base64.urlsafe_b64encode(
+            json.dumps(data, ensure_ascii=False).encode()).decode()
+    except Exception:
+        pass
+
+
+def _draft_clear() -> None:
+    """清掉草稿（保存成功 / 用户主动清空重填）。"""
+    st.session_state.pop(DRAFT_SS, None)
+    if DRAFT_QP in st.query_params:
+        del st.query_params[DRAFT_QP]
+
+
+def _pending_draft() -> bool:
+    d = _draft_load()
+    return bool(d and any(_entry_has_content(e)
+                          for e in d.get("entries", {}).values()))
+
+
+def _sync_draft() -> None:
+    """弹窗内任一控件变化时（on_change）实时把草稿落袋。"""
+    entries = {}
+    for p in PLATFORMS:
+        entries[p] = {
+            "on": bool(st.session_state.get(f"{p}_on", True)),
+            "mode": st.session_state.get(f"{p}_mode", "当日收益"),
+            "daily": float(st.session_state.get(f"{p}_daily") or 0.0),
+            "mv": float(st.session_state.get(f"{p}_mv") or 0.0),
+            "tp": float(st.session_state.get(f"{p}_tp") or 0.0),
+        }
+    _draft_save(st.session_state.get("entry_date") or date.today(), entries)
+
+
+def _restore_draft_dialog() -> None:
+    """新会话（切后台被重载/刷新）且存在未提交草稿 → 自动重开录入弹窗。
+
+    每个会话只自动重开一次：填一半切去别的 App 抄数，回来时面板与
+    数字自动恢复，不用重新录入。
+    """
+    if st.session_state.get("_draft_session_checked"):
+        return
+    st.session_state["_draft_session_checked"] = True
+    if _pending_draft():
+        entry_dialog()
+
+
 def apply_entries(d_in: date, entries: dict) -> list:
     """保存弹窗提交（UI 只收集，保存统一走这里，便于测试）。
 
@@ -789,43 +877,94 @@ def apply_entries(d_in: date, entries: dict) -> list:
 
 @st.dialog("录入数据", width="large")
 def entry_dialog():
-    d_in = st.date_input("日期", value=date.today())
+    # 草稿回填：控件状态不在（重新打开 / 切后台重载后）时用草稿值，
+    # 在则保留用户当前输入，不动
+    draft = _draft_load() or {}
+    ents = draft.get("entries", {})
+    if "entry_date" not in st.session_state:
+        try:
+            st.session_state["entry_date"] = (
+                date.fromisoformat(draft["date"]) if draft.get("date")
+                else date.today())
+        except Exception:
+            st.session_state["entry_date"] = date.today()
+    for p in PLATFORMS:
+        e = ents.get(p, {})
+        mode0 = e.get("mode")
+        if mode0 not in ("当日收益", "市值 + 总收益"):
+            mode0 = "当日收益"
+        st.session_state.setdefault(f"{p}_on", bool(e.get("on", True)))
+        st.session_state.setdefault(f"{p}_mode", mode0)
+        st.session_state.setdefault(f"{p}_daily", float(e.get("daily") or 0.0))
+        st.session_state.setdefault(f"{p}_mv", float(e.get("mv") or 0.0))
+        st.session_state.setdefault(f"{p}_tp", float(e.get("tp") or 0.0))
+
+    d_in = st.date_input("日期", key="entry_date", on_change=_sync_draft)
     st.caption("两种方式可混用：**① 当日收益**——只抄 1 个数，市值/总收益按上一条记录自动推算"
-               "　**② 市值 + 总收益**（市值可留 0 = 今天不记；申赎/出入金当天建议用这个）")
+               "　**② 市值 + 总收益**（市值可留 0 = 今天不记；申赎/出入金当天建议用这个）"
+               "　（已填内容自动保留：切去别的 App 抄数再回来不用重填）")
     entries = {}
     cols = st.columns(len(PLATFORMS))
     for col, p in zip(cols, PLATFORMS):
         with col:
-            on = st.checkbox(f"今日录入 {p}", value=True, key=f"{p}_on")
+            on = st.checkbox(f"今日录入 {p}", key=f"{p}_on",
+                             on_change=_sync_draft)
             mode = st.radio(
                 f"{p} · 方式", ["当日收益", "市值 + 总收益"],
                 key=f"{p}_mode", horizontal=True,
                 disabled=not on, label_visibility="collapsed",
+                on_change=_sync_draft,
             )
             daily_in = st.number_input(
                 f"{p} · 当日收益（当天赚/亏，非累计）", step=0.01, format="%.2f",
                 key=f"{p}_daily", disabled=(not on or mode != "当日收益"),
+                on_change=_sync_draft,
             )
             mv_in = st.number_input(
                 f"{p} · 当日市值", step=0.01, format="%.2f",
                 key=f"{p}_mv", disabled=(not on or mode != "市值 + 总收益"),
                 help="留 0 = 今天不记市值（该平台当日不显示收益率，金额不受影响）",
+                on_change=_sync_draft,
             )
             tp_in = st.number_input(
                 f"{p} · 总收益（累计）", step=0.01, format="%.2f",
                 key=f"{p}_tp", disabled=(not on or mode != "市值 + 总收益"),
+                on_change=_sync_draft,
             )
             if mode == "当日收益":
                 entries[p] = (on, "daily", daily_in)
             else:
                 entries[p] = (on, "full", mv_in, tp_in)
 
-    if st.button("保存", type="primary", use_container_width=True,
-                 disabled=not any(e[0] for e in entries.values())):
+    cb1, cb2 = st.columns([3, 1])
+    with cb1:
+        save_clicked = st.button(
+            "保存", type="primary", use_container_width=True,
+            disabled=not any(e[0] for e in entries.values()))
+    with cb2:
+        clear_clicked = st.button("清空重填", use_container_width=True)
+    if save_clicked:
         saved = apply_entries(d_in, entries)
+        _draft_clear()
         st.success(f"{d_in} 已保存：{'、'.join(saved)}（同日重复保存=覆盖）")
         st.caption("点右上角 ✕ 关闭弹窗返回主页，指标与图表会自动刷新。")
+    if clear_clicked:
+        # 直接改控件值会触发 Streamlit「widget 渲染后状态不可改」限制，
+        # 故打标记，下一次运行开头（控件尚未实例化时）统一清理
+        st.session_state["_clear_entry_draft"] = True
+        st.rerun()
 
+
+# 「清空重填」的延迟清理：必须在任何控件实例化之前执行，
+# 否则会触发 Streamlit「widget 渲染后其状态不可再改」的限制
+_CLEAR_DRAFT = st.session_state.pop("_clear_entry_draft", False)
+if _CLEAR_DRAFT:
+    _draft_clear()
+    for _k in [k for k in list(st.session_state)
+               if k == "entry_date"
+               or any(k.startswith(f"{p}_") for p in PLATFORMS)]:
+        del st.session_state[_k]
+    entry_dialog()          # 清空后把空白面板重新打开，直接重填
 
 df = load_df()
 if df.empty:
@@ -833,6 +972,8 @@ if df.empty:
             "或只填「当日收益」（自动推算），都行。")
     if st.button("✏️ 录入数据", type="primary"):
         entry_dialog()
+    else:
+        _restore_draft_dialog()
     st.stop()
 
 d = prep_daily(df)
@@ -902,6 +1043,8 @@ b1, b2 = st.columns([1, 3])
 with b1:
     if st.button("✏️ 录入数据", type="primary"):
         entry_dialog()
+    else:
+        _restore_draft_dialog()     # 切后台重载后：有草稿则自动重开面板
 with b2:
     st.caption("同日重复保存=覆盖；取消勾选并保存=移除该平台当日记录（数值留在弹窗里可恢复）")
 
