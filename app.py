@@ -8,9 +8,9 @@
   该平台无更早记录时，当日收益即首期盈亏）
 - 每日收益 = 当次总收益 − 该平台上一条总收益；**每平台首条记录**把它的总收益整体当作首期盈亏
   （日历 日/月/年、明细表、月度统计都会体现这笔建仓以来的收益；遇申赎当天会失真，属预期）
-- 收益率走势 = 自建仓累计收益率：分母固定 = 第一天倒推的初始本金（第一天市值 − 第一天总收益）
-  （第一天就有真实收益率，不再从 0 起；叠加指数也用同一起点算累计涨跌，跑赢/跑输才可比；
-   时间范围「本周/本月/本年/全部」只控制显示哪一段）
+- 收益率走势 = 区间内积累收益率：曲线从所选区间起点重新算，起点前的收益不计入
+  （分母固定 = 第一天倒推的初始本金，与对比条一致，曲线终点即对比条数值；
+   叠加指数也以区间起点为基期，跑赢/跑输才可比；「全部」区间即自建仓累计）
 - 日历 / 当日收益率 = 当期口径：当日（当月/当年）赚的钱 ÷ 期初市值
 - 同日同平台重复保存 = 覆盖；取消勾选并保存 = 移除该平台当日记录
 - 某平台某天未录入：总市值 / 总收益沿用其最近一次值（曲线不出现假跌）
@@ -537,11 +537,14 @@ def initial_capital(d: pd.DataFrame) -> dict:
 
 
 def cumulative_return_curves(d: pd.DataFrame, start, scopes, bases: dict):
-    """自建仓累计收益率曲线（%）：分母固定 = 第一天倒推的初始本金。
+    """区间累计收益率曲线（%）：从所选区间起点重新积累，起点前的收益不计入。
 
-    每天数值 = 当天累计总收益 ÷ 初始本金 × 100%（含建仓以来的历史收益）。
-    start 只决定显示哪一段，曲线不自区间起点归零。
-    d: prep_daily 结果；start: pd.Timestamp；scopes: [(名称, [平台...]), ...]
+    每天数值 =（当天累计总收益 − 区间起点前最后一条总收益）÷ 初始本金 × 100%。
+    平台在区间起点前无记录时其基数按 0（首条记录的建仓首期盈亏照常计入）；
+    「全部」区间即自建仓累计。分母固定 = 初始本金，与对比条四档口径一致
+    （曲线终点 = 对比条的区间收益率）。
+    start 只决定从哪天起算；d: prep_daily 结果；start: pd.Timestamp；
+    scopes: [(名称, [平台...]), ...]
     返回 long 表：日期, 名称, 收益率, 当日金额。
     """
     empty = pd.DataFrame(columns=["日期", "名称", "收益率", "当日金额"])
@@ -560,12 +563,15 @@ def cumulative_return_curves(d: pd.DataFrame, start, scopes, bases: dict):
         if den <= 0:
             continue
         contrib = pd.DataFrame(index=range_idx)
+        base_sum = 0.0
         for p in usable:
+            pre = pv_pnl[p][pv_pnl.index < start].dropna()
+            base_sum += float(pre.iloc[-1]) if not pre.empty else 0.0
             contrib[p] = pv_pnl[p].reindex(range_idx)
         if len(usable) == 1:
-            num = contrib[usable[0]]                        # 单平台：无数据日留空
+            num = contrib[usable[0]] - base_sum         # 单平台：无数据日留空
         else:
-            num = contrib.sum(axis=1, skipna=True, min_count=1)
+            num = contrib.sum(axis=1, skipna=True, min_count=1) - base_sum
         dsub = d[d["platform"].isin(usable) & (d["date"] >= start)]
         amt = (dsub.groupby("date")["当日收益"].sum()
                .reindex(range_idx).fillna(0.0))
@@ -1079,15 +1085,15 @@ with st.container(border=True):
     if not curves.empty:
         parts.append(curves)
     if idx_name != "无":
-        first_day = d["date"].min()      # 建仓日：指数与收益同一起点，跑赢/跑输才可比
-        beg = (first_day - timedelta(days=25)).strftime("%Y%m%d")
+        first_day = d["date"].min()      # 取数下限：建仓日与区间起点取更早者
+        beg = (min(first_day, start) - timedelta(days=25)).strftime("%Y%m%d")
         idf = fetch_index(INDEXES[idx_name], beg)
         if idf is None or idf.empty:
             st.caption(f"{idx_name}数据获取失败（可能网络不通），已跳过叠加。")
         elif not curves.empty:
             idx_label = idx_name
             idx_range = pd.DatetimeIndex(sorted(curves["日期"].unique()))
-            s = index_relative(idf, first_day, idx_range)
+            s = index_relative(idf, start, idx_range)  # 指数同以区间起点为基期，与曲线口径一致
             parts.append(pd.DataFrame({
                 "日期": s.index, "名称": idx_label,
                 "收益率": s.values, "当日金额": float("nan"),
@@ -1132,7 +1138,7 @@ with st.container(border=True):
 
         # 跑赢/跑输对比条（白色半透明底）——分子按所选时间范围取区间收益，
         # 分母固定 = 初始本金；数值随 本周/本月/本年/全部 切换而变化
-        #（曲线本身仍是自建仓累计，分母同为初始本金，口径一致）
+        #（曲线同样是区间内积累、分母同为初始本金，曲线终点 = 本条数值，口径一致）
         primary = "总收益" if sel_scope_a in ("总收益", "全部叠加") else sel_scope_a
         sub = (curves[curves["名称"] == primary]["收益率"].dropna()
                if not curves.empty else pd.Series(dtype=float))
@@ -1157,11 +1163,13 @@ with st.container(border=True):
                          "全部": "建仓以来"}[sel_range]
             my_txt = (f"{my_ret:+.2f}%" if pd.notna(my_ret) else "—")
             line = f"<b>{primary}·{range_txt}收益率：{my_txt}</b>"
-            # 非「全部」区间：顺带保留自建仓累计收益率，两种口径都能看到
+            # 非「全部」区间：顺带保留自建仓累计收益率（独立按全历史算），两种口径都能看到
             if sel_range != "全部":
-                cum_last = float(sub.iloc[-1])
-                line += (f"<span style='opacity:.55'>　（建仓以来累计 "
-                         f"{cum_last:+.2f}%）</span>")
+                cum_all = ((float(pnl.iloc[-1]) / mv_base * 100)
+                           if mv_base > 0 else float("nan"))
+                if pd.notna(cum_all):
+                    line += (f"<span style='opacity:.55'>　（建仓以来累计 "
+                             f"{cum_all:+.2f}%）</span>")
             if idx_label:
                 idx_rows = plot_df[plot_df["名称"] == idx_label]["收益率"].dropna()
                 if not idx_rows.empty:
@@ -1301,8 +1309,8 @@ with st.expander("月度统计"):
 st.caption(
     "每日收益=总收益逐次差值；每平台首条记录把总收益整体计为首期盈亏（首日/首月/首年都体现） ｜ "
     "遇申赎当日会失真属预期 ｜ "
-    "走势图=自建仓累计收益率，分母固定=第一天倒推的初始本金（第一天市值−第一天总收益） ｜ "
-    "叠加指数同起点（建仓日）累计，跑赢/跑输按同一基期对比 ｜ "
+    "走势图=区间内积累收益率（从所选区间起点重新算，分母固定=第一天倒推的初始本金，曲线终点即对比条数值；「全部」即自建仓累计） ｜ "
+    "叠加指数以区间起点为基期累计，跑赢/跑输按同一基期对比 ｜ "
     "日历与当日收益率=当期口径（当期赚的钱÷期初市值），市值漏填的日子显示「—」 ｜ "
     "漏录平台时市值/总收益沿用其最近一次值 ｜ "
     "指数数据来自东方财富公开接口，仅供参考"
