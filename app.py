@@ -13,6 +13,8 @@
    叠加指数也以区间起点为基期，跑赢/跑输才可比；「全部」区间即自建仓累计）
 - 日历 / 当日收益率 = 当期口径：当日（当月/当年）赚的钱 ÷ 期初市值
 - 同日同平台重复保存 = 覆盖；取消勾选并保存 = 移除该平台当日记录
+- 平台清仓：录入弹窗勾「已全部清仓」→ 该条起市值按 0 计（总市值/收益率分母剔除），
+  总收益原样保留（继续计入累计收益与「全部」走势，实现收益继承；此后无需再录该平台）
 - 某平台某天未录入：总市值 / 总收益沿用其最近一次值（曲线不出现假跌）
 - 市值漏填（0 或空）的日子收益率显示「—」，不影响金额类数值
 - 收益率走势（本周/本月/本年/全部 × 总/分平台/叠加）可叠加 A 股主要指数对比
@@ -427,22 +429,31 @@ def init_db() -> None:
             "INSERT OR REPLACE INTO records(date, platform, total_pnl) "
             "SELECT date, platform, total_pnl FROM records_v1_backup"
         )
+    # v3.9.2：清仓标记列（0=正常，1=该条起该平台已全部清仓，市值按 0 计）
+    cols = [r[1] for r in con.execute("PRAGMA table_info(records)")]
+    if "cleared" not in cols:
+        con.execute("ALTER TABLE records ADD COLUMN cleared INTEGER DEFAULT 0")
     con.commit()
     con.close()
 
 
-def upsert(d: date, platform: str, market_value: float, total: float) -> None:
+def upsert(d: date, platform: str, market_value: float, total: float,
+           cleared: bool = False) -> None:
     """同日同平台重复保存 = 覆盖。
 
     市值留 0（或 None）= 今天不记市值，存 NULL：该平台当日不显示收益率，
-    金额类数值不受影响。
+    金额类数值不受影响。cleared=True = 已全部清仓：市值强制按 0 存，
+    总收益原样保留（继续计入累计收益，此后无需再录）。
     """
     con = sqlite3.connect(DB)
     mv = (float(market_value)
-          if market_value is not None and float(market_value) > 0 else None)
+          if not cleared and market_value is not None
+          and float(market_value) > 0 else None)
     con.execute(
-        "INSERT OR REPLACE INTO records VALUES(?,?,?,?)",
-        (d.isoformat(), platform, mv, float(total)),
+        "INSERT OR REPLACE INTO "
+        "records(date, platform, market_value, total_pnl, cleared) "
+        "VALUES(?,?,?,?,?)",
+        (d.isoformat(), platform, mv, float(total), 1 if cleared else 0),
     )
     con.commit()
     con.close()
@@ -492,6 +503,8 @@ def load_df() -> pd.DataFrame:
     con.close()
     if df.empty:
         return df
+    if "cleared" not in df.columns:
+        df["cleared"] = 0
     df["date"] = pd.to_datetime(df["date"])
     return df.sort_values("date", kind="stable")
 
@@ -513,6 +526,10 @@ def prep_daily(df: pd.DataFrame) -> pd.DataFrame:
     d["当日收益率"] = (d["当日收益"] / d["前期市值"] * 100).where(
         (d["前期市值"] > 0) & (d["market_value"] > 0)
     )
+    # 已清仓记录：前期市值按 0 → 当日收益率 NaN，
+    # 总览卡「当日收益率」分母（最后一天各平台前期市值合计）自动不含它
+    if "cleared" in d.columns:
+        d.loc[d["cleared"].fillna(0) > 0, "前期市值"] = 0.0
     return d
 
 
@@ -545,11 +562,20 @@ def cumulative_return_curves(d: pd.DataFrame, start, scopes, bases: dict):
     （曲线终点 = 对比条的区间收益率）。
     start 只决定从哪天起算；d: prep_daily 结果；start: pd.Timestamp；
     scopes: [(名称, [平台...]), ...]
-    返回 long 表：日期, 名称, 收益率, 当日金额。
+    返回 long 表：日期, 名称, 收益率, 当日金额, 当日收益率（字符串，供悬停）。
     """
-    empty = pd.DataFrame(columns=["日期", "名称", "收益率", "当日金额"])
+    empty = pd.DataFrame(
+        columns=["日期", "名称", "收益率", "当日金额", "当日收益率"])
     start = pd.Timestamp(start)
     pv_pnl = d.pivot(index="date", columns="platform", values="total_pnl").ffill()
+    # 期初市值：前一记录日的有效市值（清仓平台从清仓记录起按 0 计）
+    mv_p = d.pivot(index="date", columns="platform", values="market_value")
+    mv_p = mv_p.mask(mv_p <= 0).ffill()
+    if "cleared" in d.columns:
+        _cl = d.pivot(index="date", columns="platform",
+                      values="cleared").fillna(0).cummax()
+        mv_p = mv_p.mask(_cl > 0, 0.0)
+    mv_prev = mv_p.shift(1)
     range_idx = pv_pnl.index[pv_pnl.index >= start]
     if len(range_idx) == 0:
         return empty
@@ -575,10 +601,16 @@ def cumulative_return_curves(d: pd.DataFrame, start, scopes, bases: dict):
         dsub = d[d["platform"].isin(usable) & (d["date"] >= start)]
         amt = (dsub.groupby("date")["当日收益"].sum()
                .reindex(range_idx).fillna(0.0))
+        # 悬停用当日收益率 = 当日赚的钱 ÷ 期初市值（口径同日历；无市值时「—」）
+        denom_d = (mv_prev[usable].sum(axis=1, skipna=True, min_count=1)
+                   .reindex(range_idx))
+        day_rate = (amt / denom_d * 100).map(
+            lambda v: f"{v:+.2f}%" if pd.notna(v) else "—")
         frames.append(pd.DataFrame({
             "日期": range_idx, "名称": name,
             "收益率": (num / den * 100).values,
             "当日金额": amt.values,
+            "当日收益率": day_rate.values,
         }))
     if not frames:
         return empty
@@ -650,6 +682,26 @@ def _cell(value, top, cls, title=""):
             f'<div class="v{big}">{value}</div></div>')
 
 
+def _emoji_marks(vals: dict) -> dict:
+    """当页最赚 👍 / 最亏 😢（按当前显示值比）。
+
+    只在真赚/真亏时发：全亏页的「最不亏」不发 👍，
+    全赚页的「最小涨」不发 😢；全相等且为正只发 👍。
+    """
+    if not vals:
+        return {}
+    marks = {}
+    bk = max(vals, key=vals.get)
+    wk = min(vals, key=vals.get)
+    if bk == wk:
+        return {bk: "👍"} if vals[bk] > 0 else {}
+    if vals[bk] > 0:
+        marks[bk] = "👍"
+    if vals[wk] < 0:
+        marks[wk] = "😢"
+    return marks
+
+
 def _foot_html(left_label, left_v, idx_name, idx_v):
     c1 = _sign_color(left_v)
     c2 = _sign_color(idx_v)
@@ -662,13 +714,24 @@ def _foot_html(left_label, left_v, idx_name, idx_v):
 
 def calendar_day_html(g: pd.DataFrame, year: int, month: int,
                       value_mode: str, today: date) -> str | None:
-    """日视图：周一~周五排布的日格网格（仿养基宝）。"""
+    """日视图：周一~周五排布的日格网格（仿养基宝）。
+
+    赚=浅红 / 亏=浅绿两档；最赚 👍 / 最亏 😢；今天保持实色高亮。
+    """
     import calendar as pycal
     fw = pycal.weekday(year, month, 1)   # 1 号是周几（0=周一）
     ndays = pycal.monthrange(year, month)[1]
     nweeks = (fw + ndays + 6) // 7
     lookup = {ts.day: (float(r.金额), float(r.收益率))
               for ts, r in zip(g["date"], g.itertuples())}
+    # 第一遍：收集当页有效显示值 → 👍😢
+    disp_vals = {}
+    for day in range(1, ndays + 1):
+        amt, rate = lookup.get(day, (None, None))
+        v = rate if value_mode == "收益率" else amt
+        if v is not None and not pd.isna(v):
+            disp_vals[day] = float(v)
+    emojis = _emoji_marks(disp_vals)
     rows = ['<div class="pcal-row pcal-cols-5">'
             + "".join(f'<div class="pcal-hd">{h}</div>'
                       for h in ["一", "二", "三", "四", "五"])
@@ -703,6 +766,8 @@ def calendar_day_html(g: pd.DataFrame, year: int, month: int,
             else:
                 cls = ""
             disp = "" if amt is None else _fmt_signed(v, value_mode)
+            if day in emojis and disp:
+                disp += emojis[day]
             cells.append(_cell(disp, top, cls, title))
         rows.append('<div class="pcal-row pcal-cols-5">' + "".join(cells) + "</div>")
     return "".join(rows)
@@ -710,11 +775,14 @@ def calendar_day_html(g: pd.DataFrame, year: int, month: int,
 
 def calendar_month_html(ms: pd.DataFrame, year: int, value_mode: str,
                         today: date) -> str:
-    """月视图：12 个月卡网格。"""
+    """月视图：12 个月卡网格（两档配色 + 👍😢，逻辑同日视图）。"""
     col = "月收益率" if value_mode == "收益率" else "月金额"
     look = {(ts.year, ts.month): v for ts, v in zip(ms.index, ms[col])}
     look_amt = {(ts.year, ts.month): v for ts, v in zip(ms.index, ms["月金额"])}
     look_rate = {(ts.year, ts.month): v for ts, v in zip(ms.index, ms["月收益率"])}
+    disp_vals = {k: float(v) for k, v in look.items()
+                 if v is not None and not pd.isna(v)}
+    emojis = _emoji_marks(disp_vals)
     rows = []
     for mo in range(1, 13):
         v = look.get((year, mo))
@@ -737,7 +805,10 @@ def calendar_month_html(ms: pd.DataFrame, year: int, value_mode: str,
             cls = "pcal-neg"
         else:
             cls = ""
-        rows.append(_cell(_fmt_signed(v, value_mode), top, cls, title))
+        disp = _fmt_signed(v, value_mode)
+        if (year, mo) in emojis and disp and disp != "—":
+            disp += emojis[(year, mo)]
+        rows.append(_cell(disp, top, cls, title))
         if mo % 4 == 0:
             rows.append("</div><div class='pcal-row pcal-cols-4'>" if mo < 12 else "")
     body = ('<div class="pcal-row pcal-cols-4">' + "".join(rows) + "</div>")
@@ -746,7 +817,13 @@ def calendar_month_html(ms: pd.DataFrame, year: int, value_mode: str,
 
 
 def calendar_year_html(ys: pd.DataFrame, value_mode: str, today: date) -> str:
-    """年视图：年卡网格。"""
+    """年视图：年卡网格（两档配色 + 👍😢，逻辑同日视图）。"""
+    disp_vals = {}
+    for r in ys.itertuples():
+        v = r.年收益率 if value_mode == "收益率" else r.年收益金额
+        if v is not None and not pd.isna(v):
+            disp_vals[r.年份] = float(v)
+    emojis = _emoji_marks(disp_vals)
     rows = []
     for r in ys.itertuples():
         v = r.年收益率 if value_mode == "收益率" else r.年收益金额
@@ -767,7 +844,10 @@ def calendar_year_html(ys: pd.DataFrame, value_mode: str, today: date) -> str:
             cls = "pcal-neg"
         else:
             cls = ""
-        rows.append(_cell(_fmt_signed(v, value_mode), str(r.年份), cls, title))
+        disp = _fmt_signed(v, value_mode)
+        if r.年份 in emojis and disp and disp != "—":
+            disp += emojis[r.年份]
+        rows.append(_cell(disp, str(r.年份), cls, title))
     return '<div class="pcal-row pcal-cols-3">' + "".join(rows) + "</div>"
 
 
@@ -784,6 +864,7 @@ def _entry_has_content(e: dict) -> bool:
     """这份平台填写是否算「有内容」（全默认则不算，避免无谓自动弹窗）。"""
     return bool(e.get("daily") or e.get("mv") or e.get("tp")
                 or e.get("on") is False
+                or e.get("cleared")
                 or e.get("mode") not in (None, "当日收益"))
 
 
@@ -843,6 +924,7 @@ def _sync_draft() -> None:
             "daily": float(st.session_state.get(f"{p}_daily") or 0.0),
             "mv": float(st.session_state.get(f"{p}_mv") or 0.0),
             "tp": float(st.session_state.get(f"{p}_tp") or 0.0),
+            "cleared": bool(st.session_state.get(f"{p}_cleared")),
         }
     _draft_save(st.session_state.get("entry_date") or date.today(), entries)
 
@@ -863,20 +945,22 @@ def _restore_draft_dialog() -> None:
 def apply_entries(d_in: date, entries: dict) -> list:
     """保存弹窗提交（UI 只收集，保存统一走这里，便于测试）。
 
-    entries = {平台: (on, 模式, 值...)}：
-      (True, "daily", 当日收益) / (True, "full", 市值, 总收益) / (False, ...)
-    返回已保存的平台列表；未勾选的平台其当日记录被移除。
+    entries = {平台: (on, 模式, daily, mv, tp, cleared)}（统一 6 元组）：
+      模式 "daily" 只用 daily；"full" 用 mv / tp；
+      cleared=True = 已全部清仓：市值强制按 0 存，总收益原样保留。
+      on=False 的平台其当日记录被移除。返回已保存的平台列表。
     """
     saved = []
     for p, e in entries.items():
         if not e[0]:
             delete(d_in, p)          # 勾掉并保存 = 移除该平台当日记录
-        elif e[1] == "daily":
-            mv, tp = resolve_daily_entry(d_in, p, e[2])
-            upsert(d_in, p, mv, tp)
-            saved.append(p)
         else:
-            upsert(d_in, p, e[2], e[3])
+            cleared = bool(e[5]) if len(e) > 5 else False
+            if e[1] == "daily":
+                mv, tp = resolve_daily_entry(d_in, p, e[2])
+            else:
+                mv, tp = (0.0 if cleared else e[3]), e[4]
+            upsert(d_in, p, mv, tp, cleared)
             saved.append(p)
     return saved
 
@@ -904,6 +988,7 @@ def entry_dialog():
         st.session_state.setdefault(f"{p}_daily", float(e.get("daily") or 0.0))
         st.session_state.setdefault(f"{p}_mv", float(e.get("mv") or 0.0))
         st.session_state.setdefault(f"{p}_tp", float(e.get("tp") or 0.0))
+        st.session_state.setdefault(f"{p}_cleared", bool(e.get("cleared")))
 
     d_in = st.date_input("日期", key="entry_date", on_change=_sync_draft)
     st.caption("两种方式可混用：**① 当日收益**——只抄 1 个数，市值/总收益按上一条记录自动推算"
@@ -928,7 +1013,9 @@ def entry_dialog():
             )
             mv_in = st.number_input(
                 f"{p} · 当日市值", step=0.01, format="%.2f",
-                key=f"{p}_mv", disabled=(not on or mode != "市值 + 总收益"),
+                key=f"{p}_mv",
+                disabled=(not on or mode != "市值 + 总收益"
+                          or st.session_state.get(f"{p}_cleared")),
                 help="留 0 = 今天不记市值（该平台当日不显示收益率，金额不受影响）",
                 on_change=_sync_draft,
             )
@@ -937,10 +1024,18 @@ def entry_dialog():
                 key=f"{p}_tp", disabled=(not on or mode != "市值 + 总收益"),
                 on_change=_sync_draft,
             )
+            cleared_in = st.checkbox(
+                f"{p} 已全部清仓（赎回完了勾这个）",
+                key=f"{p}_cleared", disabled=(not on or mode != "市值 + 总收益"),
+                help="勾选后市值按 0 计：总市值与收益率分母不再包含该平台，"
+                     "总收益原样保留（继续计入累计收益），此后无需再录该平台；"
+                     "以后又买了就正常录一条市值即可自动解除",
+                on_change=_sync_draft,
+            )
             if mode == "当日收益":
-                entries[p] = (on, "daily", daily_in)
+                entries[p] = (on, "daily", daily_in, 0.0, 0.0, False)
             else:
-                entries[p] = (on, "full", mv_in, tp_in)
+                entries[p] = (on, "full", 0.0, mv_in, tp_in, cleared_in)
 
     cb1, cb2 = st.columns([3, 1])
     with cb1:
@@ -1000,6 +1095,9 @@ last_rows = d[d["date"] == last_date]
 pv_pnl = d.pivot(index="date", columns="platform", values="total_pnl").ffill()
 mv = d.pivot(index="date", columns="platform", values="market_value")
 pv_mv = mv.mask(mv <= 0).ffill()
+# 已清仓平台：从其清仓记录起市值按 0 计（总市值剔除、收益保留）
+_cl = d.pivot(index="date", columns="platform", values="cleared").fillna(0).cummax()
+pv_mv = pv_mv.mask(_cl > 0, 0.0)
 cum_by_date = pv_pnl.sum(axis=1)
 mv_by_date = pv_mv.sum(axis=1)
 total_mv = float(mv_by_date.iloc[-1])
@@ -1106,7 +1204,7 @@ with st.container(border=True):
         fig_trend = px.line(
             plot_df, x="日期", y="收益率", color="名称", markers=True,
             color_discrete_sequence=TREND_COLORS,
-            custom_data=["当日金额"],
+            custom_data=["当日金额", "当日收益率"],
         )
         for tr in fig_trend.data:
             if tr.name == idx_label:  # 指数线：固定琥珀色，与蓝色系收益线明显区分
@@ -1114,7 +1212,8 @@ with st.container(border=True):
                 tr.hovertemplate = ("%{fullData.name}　%{y:.2f}%<extra></extra>")
             else:
                 tr.hovertemplate = ("%{fullData.name}　%{y:.2f}%"
-                                    "<br>当日金额 %{customdata[0]:,.2f}<extra></extra>")
+                                    "<br>当日 %{customdata[0]:,.2f}"
+                                    "　（收益率 %{customdata[1]}）<extra></extra>")
         for tr in fig_trend.data:   # 数据点：白色描边圆点，单点也清晰可见
             tr.marker = dict(size=6, line=dict(width=1.5, color="#FFFFFF"))
         fig_trend.update_yaxes(ticksuffix="%", tickformat=",")
@@ -1274,7 +1373,7 @@ with st.expander("查看明细数据"):
         day, rate = r["当日收益"], r["当日收益率"]
         rows.append([
             (f"{r['date']:%Y-%m-%d}", None),
-            (r["platform"], None),
+            (r["platform"] + ("（已清仓）" if r.get("cleared") else ""), None),
             (_fmt(r["market_value"]), None),
             (_fmt(r["total_pnl"]), _sign_color(r["total_pnl"])),
             (_fmt(day), _sign_color(day)),
@@ -1313,5 +1412,6 @@ st.caption(
     "叠加指数以区间起点为基期累计，跑赢/跑输按同一基期对比 ｜ "
     "日历与当日收益率=当期口径（当期赚的钱÷期初市值），市值漏填的日子显示「—」 ｜ "
     "漏录平台时市值/总收益沿用其最近一次值 ｜ "
+    "勾选「已全部清仓」的平台：市值按 0 计（总市值与收益率分母剔除），总收益保留继续计入累计 ｜ "
     "指数数据来自东方财富公开接口，仅供参考"
 )
