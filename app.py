@@ -21,7 +21,7 @@
   （东方财富公开接口，失败自动切腾讯源，离线/失败自动跳过）；
   对比条主数值 = 区间赚的钱 ÷ 初始本金（分母四档统一，v3.8.5）
 - 盈亏日历：仿养基宝卡片网格——
-  日=按周一~周五排布的日格（当日实心高亮）、月=12 月卡、年=年卡，
+  日=全部日期按序排入 5 列（周末/节假日休市灰格标「休」，不对齐星期）、月=12 月卡、年=年卡，
   底部显示累计收益与同期指数涨跌
 - 布局：养基宝风格——蓝色渐变总览卡 + 居中窄栏白色卡片分区
 - 背景：同目录下放置 hutao.png/jpg/... 自动作为单张固定背景（无图则跳过）
@@ -46,6 +46,21 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB = os.path.join(BASE_DIR, "portfolio.db")
 
 PLATFORMS = ["同花顺", "养基宝"]  # 新增平台只需在此列表加名字
+
+# A 股节假日休市日（周末另行判断，不在此列）。数据来源：沪深交易所年度公告，
+# **每年年初需手动更新当年安排**；不在表内的年份/日期按普通交易日处理。
+HOLIDAYS = {
+    # 2026 年（上证公告〔2025〕45 号）
+    date(2026, 1, 1), date(2026, 1, 2),                      # 元旦
+    date(2026, 2, 16), date(2026, 2, 17), date(2026, 2, 18),  # 春节
+    date(2026, 2, 19), date(2026, 2, 20), date(2026, 2, 23),
+    date(2026, 4, 6),                                        # 清明节
+    date(2026, 5, 1), date(2026, 5, 4), date(2026, 5, 5),    # 劳动节
+    date(2026, 6, 19),                                       # 端午节
+    date(2026, 9, 25),                                       # 中秋节
+    date(2026, 10, 1), date(2026, 10, 2),                    # 国庆节
+    date(2026, 10, 5), date(2026, 10, 6), date(2026, 10, 7),
+}
 
 # 录入草稿（v3.9）：手机切后台会导致 Streamlit 重连重跑、录入弹窗被关、
 # 控件状态清空。填过的内容实时落袋（session_state + URL），
@@ -631,16 +646,31 @@ def month_daily(dd: pd.DataFrame, year: int, month: int) -> pd.DataFrame:
     return g
 
 
+def _period_end_mv(dd: pd.DataFrame, freq: str = "ME") -> pd.DataFrame:
+    """各平台期末（月末/年末）有效市值，**清仓平台从清仓记录起按 0 计**。
+
+    与总览卡 / 走势图同一口径：先 mask(<=0) + ffill 补漏录日，
+    再按 cleared 累计标记把已清仓平台置 0，
+    避免已赎回平台的旧市值一直被沿用（v3.9.7 修正月度/年度分母虚高）。
+    """
+    mv = dd.pivot(index="date", columns="platform", values="market_value")
+    mv = mv.mask(mv <= 0).ffill()
+    if "cleared" in dd.columns:
+        cl = (dd.pivot(index="date", columns="platform", values="cleared")
+              .fillna(0).cummax())
+        mv = mv.mask(cl > 0, 0.0)
+    return mv.resample(freq).last()
+
+
 def monthly_summary(dd: pd.DataFrame) -> pd.DataFrame:
     """按月汇总（index=月末日期）：月金额（当月差值合计）、月收益率（%/上月末市值）。
 
     首月与首日口径一致：没有上月可减，把当月总收益整体当作当月盈亏，
-    分母用「第一天倒推的初始本金」。
+    分母用「第一天倒推的初始本金」。清仓平台市值按 0 计，不进分母。
     """
     pv_pnl = (dd.pivot(index="date", columns="platform", values="total_pnl")
               .ffill().resample("ME").last())
-    mv = dd.pivot(index="date", columns="platform", values="market_value")
-    mv = mv.mask(mv <= 0).ffill().resample("ME").last()
+    mv = _period_end_mv(dd)
     amt = pv_pnl.diff().sum(axis=1, skipna=True, min_count=1)
     prev_mv = mv.shift().sum(axis=1, skipna=True, min_count=1)
     base_total = sum(initial_capital(dd).values())
@@ -660,8 +690,7 @@ def yearly_summary(dd: pd.DataFrame) -> pd.DataFrame:
     m = monthly_summary(dd)
     if m.empty:
         return pd.DataFrame(columns=["年份", "年收益金额", "年收益率"])
-    mv = dd.pivot(index="date", columns="platform", values="market_value")
-    mv = mv.mask(mv <= 0).ffill().resample("YE").last()
+    mv = _period_end_mv(dd, "YE")
     prev = mv.shift().sum(axis=1, skipna=True, min_count=1)
     base_total = sum(initial_capital(dd).values())
     if len(prev) and pd.isna(prev.iloc[0]) and base_total > 0:
@@ -712,16 +741,20 @@ def _foot_html(left_label, left_v, idx_name, idx_v):
             f'<span>{idx_name}：<b style="color:{c2}">{iv}</b></span></div>')
 
 
+def _is_closed(d: date) -> bool:
+    """周末或 A 股节假日休市（休市日无净值变动，不产生收益）。"""
+    return d.weekday() >= 5 or d in HOLIDAYS
+
+
 def calendar_day_html(g: pd.DataFrame, year: int, month: int,
                       value_mode: str, today: date) -> str | None:
-    """日视图：周一~周五排布的日格网格（仿养基宝）。
+    """日视图：全部日期按顺序排入 5 列网格（不对齐星期）。
 
-    赚=浅红 / 亏=浅绿两档；最赚 👍 / 最亏 😢；今天保持实色高亮。
+    周末 / 节假日休市日显示灰格「休」；交易日按数据染色
+    （赚=浅红 / 亏=浅绿两档 + 最赚 👍 / 最亏 😢）；今天保持实色高亮。
     """
     import calendar as pycal
-    fw = pycal.weekday(year, month, 1)   # 1 号是周几（0=周一）
     ndays = pycal.monthrange(year, month)[1]
-    nweeks = (fw + ndays + 6) // 7
     lookup = {ts.day: (float(r.金额), float(r.收益率))
               for ts, r in zip(g["date"], g.itertuples())}
     # 第一遍：收集当页有效显示值 → 👍😢
@@ -732,21 +765,18 @@ def calendar_day_html(g: pd.DataFrame, year: int, month: int,
         if v is not None and not pd.isna(v):
             disp_vals[day] = float(v)
     emojis = _emoji_marks(disp_vals)
-    rows = ['<div class="pcal-row pcal-cols-5">'
-            + "".join(f'<div class="pcal-hd">{h}</div>'
-                      for h in ["一", "二", "三", "四", "五"])
-            + "</div>"]
-    for w in range(nweeks):
-        cells = []
-        for wd in range(5):
-            day = w * 7 + wd - fw + 1
-            if day < 1 or day > ndays:
-                cells.append('<div class="pcal-cell pcal-mute"></div>')
-                continue
-            d = date(year, month, day)
+    rows, cells = [], []
+    for day in range(1, ndays + 1):
+        d = date(year, month, day)
+        top = "今" if d == today else str(day)
+        if _is_closed(d):
+            # 休市格：灰底标「休」（不能用 continue 跳过行满检查，否则会错格）
+            cell = (f'<div class="pcal-cell pcal-mute">'
+                    f'<div class="d">{top}</div>'
+                    f'<div class="v">休</div></div>')
+        else:
             amt, rate = lookup.get(day, (None, None))
             v = rate if value_mode == "收益率" else amt
-            top = "今" if d == today else str(day)
             title = (f"{d:%Y-%m-%d}　金额 {amt:+,.2f}"
                      if amt is not None else f"{d:%Y-%m-%d}　未录入")
             if rate is not None and not pd.isna(rate):
@@ -768,7 +798,13 @@ def calendar_day_html(g: pd.DataFrame, year: int, month: int,
             disp = "" if amt is None else _fmt_signed(v, value_mode)
             if day in emojis and disp:
                 disp += emojis[day]
-            cells.append(_cell(disp, top, cls, title))
+            cell = _cell(disp, top, cls, title)
+        cells.append(cell)
+        # 每 5 格一行（末行可能不满 5 格，属预期的不规则排布）
+        if len(cells) == 5:
+            rows.append('<div class="pcal-row pcal-cols-5">' + "".join(cells) + "</div>")
+            cells = []
+    if cells:
         rows.append('<div class="pcal-row pcal-cols-5">' + "".join(cells) + "</div>")
     return "".join(rows)
 
@@ -863,7 +899,6 @@ inject_css()
 def _entry_has_content(e: dict) -> bool:
     """这份平台填写是否算「有内容」（全默认则不算，避免无谓自动弹窗）。"""
     return bool(e.get("daily") or e.get("mv") or e.get("tp")
-                or e.get("on") is False
                 or e.get("cleared")
                 or e.get("mode") not in (None, "当日收益"))
 
@@ -983,7 +1018,7 @@ def entry_dialog():
         mode0 = e.get("mode")
         if mode0 not in ("当日收益", "市值 + 总收益"):
             mode0 = "当日收益"
-        st.session_state.setdefault(f"{p}_on", bool(e.get("on", True)))
+        st.session_state.setdefault(f"{p}_on", bool(e.get("on", False)))
         st.session_state.setdefault(f"{p}_mode", mode0)
         st.session_state.setdefault(f"{p}_daily", float(e.get("daily") or 0.0))
         st.session_state.setdefault(f"{p}_mv", float(e.get("mv") or 0.0))
@@ -1261,7 +1296,12 @@ with st.container(border=True):
             range_txt = {"本周": "本周", "本月": "本月", "本年": "本年",
                          "全部": "建仓以来"}[sel_range]
             my_txt = (f"{my_ret:+.2f}%" if pd.notna(my_ret) else "—")
-            line = f"<b>{primary}·{range_txt}收益率：{my_txt}</b>"
+            # 区间积累收益总金额（同一分子：最新总收益 − 区间起点前总收益）
+            amt_txt = f"{float(pnl.iloc[-1]) - pnl_base:+,.2f}"
+            line = (f"<b>{primary}·{range_txt}收益率：{my_txt}</b>"
+                    f"<span style='opacity:.75'>（区间收益 "
+                    f"<b style='color:{_sign_color(float(pnl.iloc[-1]) - pnl_base)}'>"
+                    f"{amt_txt}</b> 元）</span>")
             # 非「全部」区间：顺带保留自建仓累计收益率（独立按全历史算），两种口径都能看到
             if sel_range != "全部":
                 cum_all = ((float(pnl.iloc[-1]) / mv_base * 100)
