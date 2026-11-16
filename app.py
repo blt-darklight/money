@@ -45,7 +45,11 @@ px.defaults.template = "plotly_white"  # 统一白底网格，配合蓝白主题
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB = os.path.join(BASE_DIR, "portfolio.db")
 
-PLATFORMS = ["同花顺", "养基宝"]  # 新增平台只需在此列表加名字
+PLATFORMS = ["同花顺", "养基宝", "银河"]  # 新增平台只需在此列表加名字
+
+# 转仓关系（新平台 ← 老平台）。只是搬钱，不是新增投入：汇总口径的分母里
+# 不再把新平台首条那条本金重复算一次。总收益照常继承，不受影响。
+PLATFORM_INHERIT = {"银河": "同花顺"}
 
 # A 股节假日休市日（周末另行判断，不在此列）。数据来源：沪深交易所年度公告，
 # **每年年初需手动更新当年安排**；不在表内的年份/日期按普通交易日处理。
@@ -568,6 +572,25 @@ def initial_capital(d: pd.DataFrame) -> dict:
     return bases
 
 
+def scope_base_sum(plats, bases: dict) -> float:
+    """一组平台的本金合计（汇总口径的分母）。
+
+    转仓目标平台只在「来源平台不在本组内」时才计入：两者同组说明这笔钱被算了
+    两次（银河首条的 1,980 本来就是从同花顺搬过去的，不是新增投入）。
+    单看银河时来源不在组内，仍按它自己的本金算，平台自身的收益率不受影响。
+    总收益（分子）一律继承、不清算，这里只动分母。
+    """
+    total = 0.0
+    for p in plats:
+        if p not in bases:
+            continue
+        src = PLATFORM_INHERIT.get(p)
+        if src and src in plats and src in bases:
+            continue
+        total += bases[p]
+    return total
+
+
 def cumulative_return_curves(d: pd.DataFrame, start, scopes, bases: dict):
     """区间累计收益率曲线（%）：从所选区间起点重新积累，起点前的收益不计入。
 
@@ -600,7 +623,7 @@ def cumulative_return_curves(d: pd.DataFrame, start, scopes, bases: dict):
         usable = [p for p in plats if p in bases]
         if not usable:
             continue
-        den = sum(bases[p] for p in usable)
+        den = scope_base_sum(usable, bases)
         if den <= 0:
             continue
         contrib = pd.DataFrame(index=range_idx)
@@ -630,6 +653,47 @@ def cumulative_return_curves(d: pd.DataFrame, start, scopes, bases: dict):
     if not frames:
         return empty
     return pd.concat(frames, ignore_index=True)
+
+
+def max_drawdown_run(s: pd.Series):
+    """区间最大回撤：从某高点跌到之后最低点、跌幅最大的一段。
+
+    s: 索引为日期的收益率曲线（单位 %）。返回 (跌幅, 高点日, 低点日)，无回撤返回 None。
+    曲线本身就是收益率，故用「百分点差」而非相对峰值的比例——负收益率阶段
+    用比例算会得到荒谬的天文数字（-2% 跌到 -20% 会被算成 900%）。
+    """
+    s = s.dropna().sort_index()
+    if len(s) < 2:
+        return None
+    peak = peak_d = None
+    best = None
+    for dt, v in s.items():
+        if peak is None or v > peak:          # 刷新高点，后续回撤从新起点算
+            peak, peak_d = v, dt
+        dd = v - peak
+        if best is None or dd < best[0]:
+            best = (dd, peak_d, dt)
+    if best is None or best[0] >= 0:          # 全程创新高 = 没有回撤
+        return None
+    return best
+
+
+def max_rally_run(s: pd.Series):
+    """区间最大涨幅：从某低点涨到之后最高点、涨幅最大的一段（百分点差）。"""
+    s = s.dropna().sort_index()
+    if len(s) < 2:
+        return None
+    trough = trough_d = None
+    best = None
+    for dt, v in s.items():
+        if trough is None or v < trough:      # 刷新低点，后续涨幅从新起点算
+            trough, trough_d = v, dt
+        gain = v - trough
+        if best is None or gain > best[0]:
+            best = (gain, trough_d, dt)
+    if best is None or best[0] <= 0:          # 全程创新低 = 没有上涨段
+        return None
+    return best
 
 
 def month_daily(dd: pd.DataFrame, year: int, month: int) -> pd.DataFrame:
@@ -671,9 +735,18 @@ def monthly_summary(dd: pd.DataFrame) -> pd.DataFrame:
     pv_pnl = (dd.pivot(index="date", columns="platform", values="total_pnl")
               .ffill().resample("ME").last())
     mv = _period_end_mv(dd)
-    amt = pv_pnl.diff().sum(axis=1, skipna=True, min_count=1)
+    diff = pv_pnl.diff()
+    # 中途新增的平台（转仓新开的账户等）：它第一次出现的那个月末，diff 只能是 NaN
+    #（上一月它在表里还不存在）。按「每平台首条记录把总收益整体计为首期盈亏」的
+    #既定口径，这里把该平台当时的累计值整格补回去，否则这笔首期会被 skipna 漏掉。
+    for _p in pv_pnl.columns:
+        _first = pv_pnl[_p].first_valid_index()
+        if _first is not None and pd.isna(diff.loc[_first, _p]):
+            diff.loc[_first, _p] = pv_pnl.loc[_first, _p]
+    amt = diff.sum(axis=1, skipna=True, min_count=1)
     prev_mv = mv.shift().sum(axis=1, skipna=True, min_count=1)
-    base_total = sum(initial_capital(dd).values())
+    _b = initial_capital(dd)
+    base_total = scope_base_sum(list(_b.keys()), _b)
     if len(amt) and pd.isna(amt.iloc[0]):
         amt.iloc[0] = pv_pnl.iloc[0].sum(skipna=True)    # 首月 = 建仓以来的总收益
     if len(prev_mv) and pd.isna(prev_mv.iloc[0]) and base_total > 0:
@@ -692,7 +765,8 @@ def yearly_summary(dd: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=["年份", "年收益金额", "年收益率"])
     mv = _period_end_mv(dd, "YE")
     prev = mv.shift().sum(axis=1, skipna=True, min_count=1)
-    base_total = sum(initial_capital(dd).values())
+    _b = initial_capital(dd)
+    base_total = scope_base_sum(list(_b.keys()), _b)
     if len(prev) and pd.isna(prev.iloc[0]) and base_total > 0:
         prev.iloc[0] = base_total                        # 首年分母 = 初始本金
     prev.index = prev.index.year
@@ -1140,7 +1214,7 @@ total_cum = float(cum_by_date.iloc[-1])
 daily_sum = float(last_rows["当日收益"].sum())
 denom = float(last_rows["前期市值"].sum())
 day_rate = (daily_sum / denom * 100) if denom > 0 else None
-base_total = sum(INIT_BASE.values())
+base_total = scope_base_sum(PLATFORMS_with_data, INIT_BASE)
 cum_rate = (total_cum / base_total * 100) if base_total > 0 else None
 
 rate_txt = "—" if day_rate is None or pd.isna(day_rate) else f"{day_rate:+.2f}%"
@@ -1197,11 +1271,13 @@ with st.container(border=True):
         "本年": pd.Timestamp(today.replace(month=1, day=1)),
         "全部": d["date"].min(),
     }
-    r1, r2, r3 = st.columns(3)
+    r1, r2, r3, r4 = st.columns([2.2, 2.2, 2.0, 1.5])
     sel_range = r1.radio("时间范围", list(range_map.keys()), horizontal=True)
     sel_scope_a = r2.radio(
         "范围", ["总收益"] + PLATFORMS_with_data + ["全部叠加"], horizontal=True)
     idx_name = r3.selectbox("对比指数", ["无"] + list(INDEXES.keys()))
+    show_ext = r4.toggle("极值标注", value=True,
+                         help="在图上用色块标出区间最大回撤、最大涨幅所在的那一段")
 
     if sel_scope_a == "全部叠加":
         scopes = [("总收益", PLATFORMS_with_data)] + [(p, [p]) for p in PLATFORMS_with_data]
@@ -1211,6 +1287,8 @@ with st.container(border=True):
         scopes = [(sel_scope_a, [sel_scope_a])]
 
     start = range_map[sel_range]
+    # 主曲线（画色块、算极值、对比条都基于它）：叠加模式下取「总收益」那条
+    primary = "总收益" if sel_scope_a in ("总收益", "全部叠加") else sel_scope_a
     curves = cumulative_return_curves(d, start, scopes, INIT_BASE)
 
     idx_label = None
@@ -1235,9 +1313,15 @@ with st.container(border=True):
     if not parts:
         st.info("该区间暂无数据，或缺少市值无法计算收益率。")
     else:
-        plot_df = pd.concat(parts, ignore_index=True)
+        plot_df = pd.concat(parts, ignore_index=True).sort_values(
+            ["日期", "名称"], kind="stable")
+        # X 轴只保留「有记录的那几天」：转成有序分类轴，没有记录的日期（周末、
+        # 漏录日）不出现在轴上；跨度长时带年份，避免 1 年内重复的月-日混淆
+        span_days = (plot_df["日期"].max() - plot_df["日期"].min()).days
+        xfmt = "%y-%m-%d" if span_days >= 100 else "%m-%d"
+        plot_df["横轴"] = plot_df["日期"].dt.strftime(xfmt)
         fig_trend = px.line(
-            plot_df, x="日期", y="收益率", color="名称", markers=True,
+            plot_df, x="横轴", y="收益率", color="名称", markers=True,
             color_discrete_sequence=TREND_COLORS,
             custom_data=["当日金额", "当日收益率"],
         )
@@ -1249,31 +1333,65 @@ with st.container(border=True):
                 tr.hovertemplate = ("%{fullData.name}　%{y:.2f}%"
                                     "<br>当日 %{customdata[0]:,.2f}"
                                     "　（收益率 %{customdata[1]}）<extra></extra>")
-        for tr in fig_trend.data:   # 数据点：白色描边圆点，单点也清晰可见
-            tr.marker = dict(size=6, line=dict(width=1.5, color="#FFFFFF"))
+        for tr in fig_trend.data:   # 数据点：实心圆点（去掉白描边，少一批 SVG 节点）
+            tr.marker = dict(size=5)
         fig_trend.update_yaxes(ticksuffix="%", tickformat=",")
-        # X 轴只标实际数据点：范围=首末数据日期，按点数自动稀疏刻度（多则隔几天一标）
-        x0, x1 = plot_df["日期"].min(), plot_df["日期"].max()
-        span_ms = max((x1 - x0).total_seconds() * 1000, 86400000)
-        fig_trend.update_xaxes(
-            tickformat="%m-%d",
-            range=[x0 - pd.Timedelta(hours=12), x1 + pd.Timedelta(hours=12)],
-            dtick=max(span_ms / 6, 86400000),
-        )
+        # X 轴 = 分类轴：每个刻度就是一个有记录的日期，不留空档
+        fig_trend.update_xaxes(type="category", nticks=8)
+        # 区间极值色块（开关控制）：主曲线上最大回撤 / 最大涨幅所在的那一段
+        s_main = (plot_df[plot_df["名称"] == primary]
+                  .set_index("日期")["收益率"].dropna().sort_index())
+        ext_dd = ext_up = None
+        if show_ext and len(s_main) >= 2:
+            ext_dd = max_drawdown_run(s_main)
+            ext_up = max_rally_run(s_main)
+            for run, color in ((ext_dd, "rgba(48,164,108,0.10)"),    # 回撤：浅绿（跌）
+                               (ext_up, "rgba(229,72,77,0.09)")):    # 涨幅：浅红（涨）
+                if run and run[1] != run[2]:      # 起止同一天画不出宽度，跳过
+                    fig_trend.add_vrect(
+                        x0=run[1].strftime(xfmt), x1=run[2].strftime(xfmt),
+                        fillcolor=color, layer="below", line_width=0)
         # 悬停交互：竖直比对虚线 + 该日各线数值汇总（仿支付宝盈亏分析）
         fig_trend.update_layout(
             height=330, margin=dict(t=10, b=0),
             legend=dict(orientation="h", y=1.12),
             hovermode="x unified",
+            hoverdistance=40,          # 容错放宽：手指/鼠标不必精确压到点上
+            dragmode=False,            # 关掉拖拽缩放：触屏滑动不再被图抢走
             hoverlabel=dict(bgcolor="rgba(255,255,255,0.96)",
-                            bordercolor=BLUE, font=dict(color="#1F2937")),
+                            bordercolor="rgba(0,0,0,0)",
+                            font=dict(color="#1F2937")),
         )
-        st.plotly_chart(fig_trend, **STRETCH)
+        # modebar（右上角那排相机/放大图标）一并关掉，手机端它悬停才冒出来还挡视线
+        st.plotly_chart(fig_trend, **STRETCH,
+                        config={"displayModeBar": False,
+                                "doubleClick": False,
+                                "scrollZoom": False})
+        if show_ext and (ext_dd or ext_up):
+            bits = []
+            if ext_dd:
+                bits.append(
+                    f"<b style='color:{GREEN}'>最大回撤 {ext_dd[0]:+.2f}%</b>"
+                    f"<span style='opacity:.55'>"
+                    f"（{ext_dd[1]:%m-%d} → {ext_dd[2]:%m-%d}）</span>")
+            if ext_up:
+                bits.append(
+                    f"<b style='color:{RED}'>最大涨幅 {ext_up[0]:+.2f}%</b>"
+                    f"<span style='opacity:.55'>"
+                    f"（{ext_up[1]:%m-%d} → {ext_up[2]:%m-%d}）</span>")
+            st.markdown(
+                f'<div style="background:rgba(255,255,255,0.65);'
+                f'border:1px solid rgba(46,124,246,0.08);border-radius:10px;'
+                f'padding:8px 16px;font-size:14px;color:#1F2937;margin-top:6px">'
+                f'<span style="opacity:.6">{primary}·区间极值</span>　'
+                + "　｜　".join(bits)
+                + "</div>",
+                unsafe_allow_html=True,
+            )
 
         # 跑赢/跑输对比条（白色半透明底）——分子按所选时间范围取区间收益，
         # 分母固定 = 初始本金；数值随 本周/本月/本年/全部 切换而变化
         #（曲线同样是区间内积累、分母同为初始本金，曲线终点 = 本条数值，口径一致）
-        primary = "总收益" if sel_scope_a in ("总收益", "全部叠加") else sel_scope_a
         sub = (curves[curves["名称"] == primary]["收益率"].dropna()
                if not curves.empty else pd.Series(dtype=float))
         if not sub.empty:
@@ -1290,7 +1408,7 @@ with st.container(border=True):
             start_ts = pd.Timestamp(start)
             pre = pnl[pnl.index < start_ts]
             pnl_base = float(pre.iloc[-1]) if not pre.empty else 0.0
-            mv_base = float(sum(INIT_BASE.get(p, 0.0) for p in plats_bar))
+            mv_base = scope_base_sum(plats_bar, INIT_BASE)
             my_ret = (((float(pnl.iloc[-1]) - pnl_base) / mv_base * 100)
                       if mv_base > 0 else float("nan"))
             range_txt = {"本周": "本周", "本月": "本月", "本年": "本年",
@@ -1332,10 +1450,12 @@ with st.container(border=True):
             )
 
     if INIT_BASE:  # 口径透明：把倒推出来的初始本金亮出来
-        bp = "　｜　".join(f"{p} {INIT_BASE[p]:,.2f}"
-                          for p in PLATFORMS_with_data if p in INIT_BASE)
+        bp = "　｜　".join(
+            f"{p} {INIT_BASE[p]:,.2f}"
+            + ("（转仓资金，不计入合计）" if p in PLATFORM_INHERIT else "")
+            for p in PLATFORMS_with_data if p in INIT_BASE)
         st.caption(f"初始本金（= 第一天市值 − 第一天总收益）：{bp}"
-                   f"　｜　合计 {sum(INIT_BASE.values()):,.2f}")
+                   f"　｜　合计 {scope_base_sum(PLATFORMS_with_data, INIT_BASE):,.2f}")
 
 # ---------------- 盈亏日历 ----------------
 section("盈亏日历")
